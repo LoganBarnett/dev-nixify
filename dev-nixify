@@ -1,0 +1,323 @@
+#!/usr/bin/env sh
+# dev-nixify — inject a Nix devShell onto a foreign checkout without ever
+# inflicting the injected files upon that repo's maintainers.  See README.org
+# for the full design; the short version:
+#
+#   * An "overlay" git repo (git-dir external, work-tree = base_dir) versions
+#     the injected files, so they never touch the foreign repo's index.
+#   * The foreign repo's own .git/info/exclude hides the injected files from
+#     its `git status`, so they cannot be committed by accident.
+#   * The devShell flake lives in an isolated, non-git sibling directory
+#     (base_dir/.dev-nixify/<name>), referenced from the checkout via a
+#     one-line `.envrc`.  Nix evaluates it as a path flake, so it works while
+#     untracked and copies only the two flake files into the store.
+#
+# Everything here is idempotent: re-running `repo add` rewrites the managed
+# marker blocks in place and never clobbers an existing flake.nix or .envrc.
+set -eu
+
+PROG="dev-nixify"
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+err() {
+  printf '%s: error: %s\n' "$PROG" "$*" >&2
+  exit 1
+}
+info() { printf '%s: %s\n' "$PROG" "$*"; }
+
+usage() {
+  cat <<EOF
+Usage: $PROG repo add <name>
+
+Adopt the foreign checkout at <base_dir>/<name>: wire the git excludes,
+scaffold an isolated devShell flake, and drop a one-line .envrc into the
+checkout.  The checkout must already exist (adopt-existing only).  Idempotent.
+
+Configuration:
+  Copy dev-nixify.conf.template to dev-nixify.conf (next to this script, or
+  point \$DEV_NIXIFY_CONFIG at it) and set base_dir.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Locate this script so we can find dev-nixify.conf next to it, regardless of
+# how it was invoked (PATH, symlink, relative path).
+# ---------------------------------------------------------------------------
+
+script_path=$0
+while [ -h "$script_path" ]; do
+  link=$(readlink "$script_path")
+  case $link in
+    /*) script_path=$link ;;
+    *) script_path=$(dirname "$script_path")/$link ;;
+  esac
+done
+script_dir=$(cd "$(dirname "$script_path")" && pwd)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+load_config() {
+  config=${DEV_NIXIFY_CONFIG:-$script_dir/dev-nixify.conf}
+  if [ ! -f "$config" ]; then
+    err "no config found at $config
+  Copy the template and edit it:
+    cp $script_dir/dev-nixify.conf.template $script_dir/dev-nixify.conf
+    \$EDITOR $script_dir/dev-nixify.conf"
+  fi
+  base_dir=""
+  overlay_git_dir=""
+  # The config is intentionally sourced as shell — see the template header.
+  # shellcheck disable=SC1090
+  . "$config"
+  [ -n "$base_dir" ] || err "base_dir is not set in $config"
+  [ -d "$base_dir" ] || err "base_dir does not exist: $base_dir"
+  if [ -z "$overlay_git_dir" ]; then
+    overlay_git_dir=${XDG_DATA_HOME:-$HOME/.local/share}/$PROG/overlay.git
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Overlay repo (git-dir external, work-tree = base_dir)
+# ---------------------------------------------------------------------------
+
+ovl() {
+  git --git-dir="$overlay_git_dir" --work-tree="$base_dir" "$@"
+}
+
+init_overlay() {
+  [ -d "$overlay_git_dir" ] && return 0
+  info "initializing overlay repo at $overlay_git_dir (work-tree $base_dir)"
+  mkdir -p "$(dirname "$overlay_git_dir")"
+  # --bare guarantees no .git is created inside the work-tree; we then flip it
+  # to a working repo and point it at base_dir.
+  git init --quiet --bare "$overlay_git_dir"
+  git --git-dir="$overlay_git_dir" config core.bare false
+  git --git-dir="$overlay_git_dir" config core.worktree "$base_dir"
+}
+
+# ---------------------------------------------------------------------------
+# Managed marker blocks — idempotent edits to gitignore/exclude files
+# ---------------------------------------------------------------------------
+
+# Emit $file with the [begin..end] marker block removed.  Missing file => no
+# output.
+strip_block() {
+  _f=$1
+  _b=$2
+  _e=$3
+  [ -f "$_f" ] || return 0
+  awk -v b="$_b" -v e="$_e" '
+    $0==b {skip=1}
+    skip {if ($0==e) skip=0; next}
+    {print}
+  ' "$_f"
+}
+
+# Ensure $file contains exactly one [begin..end] block with $content,
+# replacing any prior copy.  mode is "append" (default) or "prepend".
+upsert_block() {
+  _f=$1
+  _b=$2
+  _e=$3
+  _content=$4
+  _mode=${5:-append}
+  mkdir -p "$(dirname "$_f")"
+  _tmp=$(mktemp)
+  if [ "$_mode" = prepend ]; then
+    printf '%s\n%s\n%s\n' "$_b" "$_content" "$_e" >"$_tmp"
+    strip_block "$_f" "$_b" "$_e" >>"$_tmp"
+  else
+    strip_block "$_f" "$_b" "$_e" >"$_tmp"
+    printf '%s\n%s\n%s\n' "$_b" "$_content" "$_e" >>"$_tmp"
+  fi
+  mv "$_tmp" "$_f"
+}
+
+# ---------------------------------------------------------------------------
+# devShell flake scaffold (rust-template idiom, trimmed to a devShell)
+# ---------------------------------------------------------------------------
+
+write_flake() {
+  _out=$1
+  _name=$2
+  cat >"$_out" <<'EOF'
+{
+  description = "devShell for @NAME@ (injected by dev-nixify)";
+
+  inputs = {
+    # LLM: Do NOT change this URL unless explicitly directed.  This is the
+    # correct format for nixpkgs stable (25.11 is correct, not nixos-25.11).
+    nixpkgs.url = "github:NixOS/nixpkgs/25.11";
+  };
+
+  outputs = {
+    self,
+    nixpkgs,
+  } @ inputs: let
+    forAllSystems =
+      nixpkgs.lib.genAttrs nixpkgs.lib.systems.flakeExposed;
+    perSystem = forAllSystems (system: let
+      pkgs = import nixpkgs {
+        inherit system;
+      };
+
+      # Drives the dev-nixify overlay repo so you can commit the injected
+      # flakes without the verbose `git --git-dir=… --work-tree=…`.  The
+      # overlay's own core.worktree supplies the work-tree, so only the
+      # git-dir is needed (override with $DEV_NIXIFY_OVERLAY_GIT_DIR).  This is
+      # on PATH inside the devShell — e.g. `dev-nixify-git status`.
+      dev-nixify-git = pkgs.writeShellApplication {
+        name = "dev-nixify-git";
+        runtimeInputs = [pkgs.git];
+        text = ''
+          exec git --git-dir="''${DEV_NIXIFY_OVERLAY_GIT_DIR:-''${XDG_DATA_HOME:-$HOME/.local/share}/dev-nixify/overlay.git}" "$@"
+        '';
+      };
+    in {
+      devShells = {
+        default = pkgs.mkShell {
+          buildInputs = [
+            # Overlay-repo driver: dev-nixify-git status / commit / …
+            dev-nixify-git
+            # Add the tools this project needs to build and run here.
+            # pkgs.nodejs_22
+            # pkgs.go
+          ];
+          # shellHook = '''';
+        };
+      };
+    });
+  in {
+    devShells =
+      nixpkgs.lib.mapAttrs (_: p: p.devShells) perSystem;
+  };
+}
+EOF
+  # Substitute the repo name into the description.  A basename cannot contain
+  # '/', so plain sed substitution is safe.
+  sed -i.bak "s/@NAME@/$_name/g" "$_out" && rm -f "$_out.bak"
+}
+
+# ---------------------------------------------------------------------------
+# repo add
+# ---------------------------------------------------------------------------
+
+cmd_repo_add() {
+  _arg=${1:-}
+  [ -n "$_arg" ] || {
+    usage
+    exit 1
+  }
+  load_config
+
+  name=$(basename "$_arg")
+  repo_dir="$base_dir/$name"
+
+  [ -d "$repo_dir" ] ||
+    err "no checkout at $repo_dir — clone it under base_dir first (adopt-existing only)"
+  git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+    err "$repo_dir is not a git working tree"
+
+  init_overlay
+  ovl_exclude="$overlay_git_dir/info/exclude"
+
+  # 1. Overlay excludes: a single static header that ignores everything under
+  #    base_dir EXCEPT our .dev-nixify/ flake subtree.  The foreign checkouts
+  #    are nested git repos, which git treats as atomic "embedded repository"
+  #    boundaries — it will not track files inside them — so the overlay
+  #    deliberately versions only the isolated flakes, not anything in the
+  #    checkouts.  One header serves every adopted repo.
+  upsert_block "$ovl_exclude" \
+    "# >>> dev-nixify: header" "# <<< dev-nixify: header" \
+    "$(printf '# Managed by dev-nixify — do not hand-edit; run: %s repo add\n/*\n!/.dev-nixify/' "$PROG")" \
+    prepend
+
+  # 2. Host repo exclude: hide the injected files from the foreign repo's own
+  #    git status so they can never be staged/committed by accident.
+  host_exclude=$(git -C "$repo_dir" rev-parse --git-path info/exclude)
+  case $host_exclude in
+    /*) : ;;
+    *) host_exclude="$repo_dir/$host_exclude" ;;
+  esac
+  upsert_block "$host_exclude" \
+    "# >>> dev-nixify" "# <<< dev-nixify" \
+    "$(printf '# Injected by dev-nixify; do not commit.\n/.envrc\n/.direnv/')"
+
+  # 3. Isolated devShell flake (non-git path flake, versioned by the overlay).
+  flake_dir="$base_dir/.dev-nixify/$name"
+  mkdir -p "$flake_dir"
+  if [ -e "$flake_dir/flake.nix" ]; then
+    info "flake exists, leaving as-is: $flake_dir/flake.nix"
+  else
+    write_flake "$flake_dir/flake.nix" "$name"
+    info "scaffolded devShell flake: $flake_dir/flake.nix"
+  fi
+
+  # 4. .envrc in the checkout — direnv reads it from disk, so git-tracking is
+  #    irrelevant here.  path: forces path-flake semantics regardless of any
+  #    enclosing git repo.
+  if [ -e "$repo_dir/.envrc" ]; then
+    info ".envrc exists, leaving as-is: $repo_dir/.envrc"
+  else
+    printf 'use flake "path:../.dev-nixify/%s"\n' "$name" >"$repo_dir/.envrc"
+    info "wrote .envrc: $repo_dir/.envrc"
+  fi
+
+  # 5. Lock the flake inputs (best-effort; the dir is a non-git path flake, so
+  #    no git-add is needed for Nix to see it).
+  if command -v nix >/dev/null 2>&1; then
+    if nix --extra-experimental-features 'nix-command flakes' \
+      flake lock "$flake_dir" >/dev/null 2>&1; then
+      info "locked flake inputs: $flake_dir/flake.lock"
+    else
+      info "could not lock flake now (offline?) — run: nix flake lock $flake_dir"
+    fi
+  fi
+
+  # 6. Track the isolated flake in the overlay (staged, not committed — commit
+  #    it yourself with your overlay git alias when you're ready).  The .envrc
+  #    lives inside the (nested-repo) checkout and cannot be tracked here; it is
+  #    a deterministic one-liner that this command regenerates, so it needs no
+  #    versioning.
+  ovl add -- "$flake_dir/flake.nix" 2>/dev/null || true
+  if [ -e "$flake_dir/flake.lock" ]; then
+    ovl add -- "$flake_dir/flake.lock" 2>/dev/null || true
+  fi
+
+  printf '\n'
+  info "adopted '$name'"
+  printf '  overlay   : %s (work-tree %s)\n' "$overlay_git_dir" "$base_dir"
+  printf '  devShell  : %s/flake.nix  (edit buildInputs)\n' "$flake_dir"
+  printf '  next      : cd %s && direnv allow\n' "$repo_dir"
+  printf "  the injected .envrc/.direnv stay hidden from %s's own git status\n" "$name"
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+case ${1:-} in
+  repo)
+    shift
+    case ${1:-} in
+      add)
+        shift
+        cmd_repo_add "${1:-}"
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+    ;;
+  -h | --help | help | "") usage ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

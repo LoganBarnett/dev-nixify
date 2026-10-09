@@ -1,0 +1,133 @@
+#+title:     dev-nixify
+#+author:    Logan Barnett
+#+email:     logustus@gmail.com
+#+language:  en
+
+/Injects Nix flakes with devShells onto foreign repos without inflicting it
+upon others./
+
+* What it does
+
+You want a Nix ~devShell~ for a repo you don't own — the "you'll need X
+installed to build this" repos.  You do /not/ want to push ~flake.nix~,
+~flake.lock~, or ~.envrc~ onto maintainers who see no value in Nix, and you
+want zero chance of committing those files by accident.
+
+~dev-nixify~ gives you a private, versioned Nix overlay for such repos.  For
+each adopted checkout it:
+
+- keeps a single *overlay git repo* (git-dir external, work-tree =
+  ~base_dir~) that versions the isolated flakes, so they never enter any
+  foreign repo's index;
+- appends a managed block to the foreign repo's ~.git/info/exclude~ so the
+  injected files are invisible to /its/ ~git status~ — they cannot be staged
+  or committed by accident, and the exclude never leaves your machine;
+- scaffolds the ~devShell~ flake in an *isolated, non-git sibling directory*
+  (~base_dir/.dev-nixify/<name>~), referenced from the checkout by a one-line
+  ~.envrc~.
+
+The overlay tracks only the ~.dev-nixify/~ flakes.  It deliberately ignores
+the checkouts themselves: each is a nested git repo, which git treats as an
+atomic /embedded repository/ it will not descend into, so files inside a
+checkout (the ~.envrc~) cannot be tracked by the overlay anyway.  That is
+fine — the ~.envrc~ is a deterministic one-liner that ~repo add~ regenerates,
+so nothing of value goes unversioned.
+
+If the maintainer ever /does/ want the flake, delete the managed blocks and
+~git add~ it into their repo like any other file.
+
+** Why the flake lives beside the checkout, not inside it
+
+Nix only sees git-/tracked/ files, so an untracked ~flake.nix~ dropped into
+the checkout is invisible to ~nix develop~.  The alternatives are worse: a
+~use flake path:.~ reference copies the /entire/ checkout — ~.git~, ~.direnv~,
+git-ignored files and all — into the store on every edit; and ~git add~-ing
+the flake into the foreign repo reintroduces exactly the commit-risk we set
+out to remove.
+
+An isolated directory that holds only ~flake.nix~ + ~flake.lock~ sidesteps all
+of this: it is not a git repo, so Nix evaluates it as a /path flake/ (works
+while untracked) and copies only those two files.  The checkout receives just
+a ~.envrc~, which ~direnv~ reads straight from disk — git-tracking is
+irrelevant for it.
+
+* Layout
+
+#+begin_example
+~/dev/                                   ← base_dir (overlay work-tree)
+├── minimal-agent-orchestrator/          ← foreign checkout
+│   ├── .envrc   →  use flake "path:../.dev-nixify/minimal-agent-orchestrator"
+│   ├── .direnv/                             (nix-direnv cache)
+│   └── …upstream…             ⟵ its .git/info/exclude hides .envrc + .direnv/
+└── .dev-nixify/
+    └── minimal-agent-orchestrator/
+        ├── flake.nix                        (trimmed rust-template devShell)
+        └── flake.lock            ⟵ both versioned by the overlay repo
+
+overlay git-dir : ${XDG_DATA_HOME:-~/.local/share}/dev-nixify/overlay.git
+#+end_example
+
+* Usage
+
+1. Copy the config template and set your ~base_dir~:
+
+   #+begin_src sh
+   cp dev-nixify.conf.template dev-nixify.conf
+   $EDITOR dev-nixify.conf          # set base_dir="$HOME/dev"
+   #+end_src
+
+2. Clone the foreign repo under ~base_dir~ (adopt-existing only — the tool
+   does not clone for you), and check out whatever branch you want:
+
+   #+begin_src sh
+   git -C "$HOME/dev" clone https://github.com/dkoontz/minimal-agent-orchestrator
+   git -C "$HOME/dev/minimal-agent-orchestrator" switch pdca
+   #+end_src
+
+3. Adopt it:
+
+   #+begin_src sh
+   ./dev-nixify repo add minimal-agent-orchestrator
+   #+end_src
+
+4. Edit ~base_dir/.dev-nixify/minimal-agent-orchestrator/flake.nix~ to add the
+   tools the project needs, then:
+
+   #+begin_src sh
+   cd "$HOME/dev/minimal-agent-orchestrator" && direnv allow
+   #+end_src
+
+~repo add~ is idempotent: re-running it rewrites the managed exclude blocks in
+place and never clobbers an existing ~flake.nix~ or ~.envrc~.
+
+* Working with the overlay repo
+
+The overlay is an ordinary git repo whose work-tree happens to be ~base_dir~.
+Driving it by hand means the verbose
+~git --git-dir=… --work-tree=…~ — so every injected devShell ships a
+~dev-nixify-git~ command that wraps exactly that.  It is a
+~writeShellApplication~ baked into the shared flake template, on ~PATH~
+whenever ~direnv~ has a checkout's devShell active:
+
+#+begin_src sh
+cd ~/dev/minimal-agent-orchestrator   # direnv activates the devShell
+
+dev-nixify-git status                 # only the injected flakes appear
+dev-nixify-git commit -m "adopt minimal-agent-orchestrator"
+#+end_src
+
+The wrapper needs no work-tree argument — the overlay's own ~core.worktree~
+supplies it — so it resolves only the git-dir, from
+~${XDG_DATA_HOME:-$HOME/.local/share}/dev-nixify/overlay.git~ by default.
+Override that with ~$DEV_NIXIFY_OVERLAY_GIT_DIR~ if you set a custom
+~overlay_git_dir~.  Outside a devShell, the same one-liner works as a plain
+shell alias.
+
+~repo add~ stages the injected flake into the overlay for you; committing (and
+adding a remote, if you want off-machine backup) is left to you.
+
+* Configuration
+
+See ~dev-nixify.conf.template~.  ~base_dir~ is required and has no default;
+~overlay_git_dir~ is optional.  Point ~$DEV_NIXIFY_CONFIG~ at an alternate
+config path if you don't want it beside the script.

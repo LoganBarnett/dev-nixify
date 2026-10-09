@@ -1,0 +1,16 @@
+#+title:     dev-nixify — LLM notes
+#+author:    Logan Barnett
+#+email:     logustus@gmail.com
+#+language:  en
+
+Read [[./README.org]] first — it carries the full design and rationale.
+
+* Conventions
+
+- ~dev-nixify~ is a single POSIX-sh script.  Keep it POSIX (no bashisms);
+  ~nix develop~ provides ~shellcheck~ and ~shfmt~ for linting and formatting.
+- Prose (org, comments, commit bodies) uses two spaces after
+  sentence-ending punctuation.
+- The injected devShell flake follows the rust-template idiom
+  (~forAllSystems~ / ~flakeExposed~ / ~perSystem~), trimmed to a plain
+  ~devShell~.  If that idiom changes upstream, mirror it in ~write_flake~.

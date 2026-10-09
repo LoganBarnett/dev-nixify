@@ -1,0 +1,25 @@
+# dev-nixify configuration.
+#
+# Copy this file to `dev-nixify.conf` (same directory) and edit the values
+# below.  `dev-nixify.conf` is gitignored — it never gets committed.
+#
+#   cp dev-nixify.conf.template dev-nixify.conf
+#   $EDITOR dev-nixify.conf
+#
+# This file is sourced by the POSIX-sh `dev-nixify` script, so it must be
+# valid shell:  key="value", no spaces around `=`.  $HOME and other shell
+# expansions are honored.
+
+# REQUIRED.  The common-ancestor directory that holds the foreign checkouts
+# you adopt.  This is the overlay repo's work-tree.  There is deliberately no
+# default — you must set it.
+#
+#   base_dir="$HOME/dev"
+base_dir=""
+
+# OPTIONAL.  Where the overlay repo's git directory lives.  The overlay tracks
+# the injected flakes and .envrc files; its work-tree is base_dir.  Left blank,
+# it defaults to ${XDG_DATA_HOME:-$HOME/.local/share}/dev-nixify/overlay.git
+#
+#   overlay_git_dir="$HOME/.local/share/dev-nixify/overlay.git"
+overlay_git_dir=""
